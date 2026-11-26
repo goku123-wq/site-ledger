@@ -11,13 +11,22 @@ import {
 } from 'firebase/firestore';
 import { FirebaseConfig, Project, Transaction } from '../types';
 
+const DEFAULT_FIREBASE_CONFIG: FirebaseConfig = {
+  apiKey: 'AIzaSyBwwClMBkTuY2UwjKghztKypAEhfI14Yvs',
+  authDomain: 'siteledger-17e91.firebaseapp.com',
+  projectId: 'siteledger-17e91',
+  storageBucket: 'siteledger-17e91.firebasestorage.app',
+  messagingSenderId: '158376676691',
+  appId: '1:158376676691:web:2aafaf903e0aaba904a5a6',
+};
+
 export function getEnvFirebaseConfig(): FirebaseConfig | undefined {
   const apiKey = import.meta.env.VITE_FIREBASE_API_KEY as string | undefined;
   const authDomain = import.meta.env.VITE_FIREBASE_AUTH_DOMAIN as string | undefined;
   const projectId = import.meta.env.VITE_FIREBASE_PROJECT_ID as string | undefined;
   const appId = import.meta.env.VITE_FIREBASE_APP_ID as string | undefined;
 
-  if (!apiKey || !projectId || !appId) return undefined;
+  if (!apiKey || !projectId || !appId) return DEFAULT_FIREBASE_CONFIG;
   return {
     apiKey,
     authDomain: authDomain || `${projectId}.firebaseapp.com`,
