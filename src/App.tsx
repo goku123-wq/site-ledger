@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowDownLeft,
   ChevronDown,
+  Cloud,
   FolderKanban,
   HardHat,
   LayoutDashboard,
@@ -11,7 +12,13 @@ import {
   Settings,
   Users,
 } from 'lucide-react';
-import { AppState, Project, Transaction, TransactionType } from './types';
+import {
+  AppState,
+  FirebaseConfig,
+  Project,
+  Transaction,
+  TransactionType,
+} from './types';
 import {
   buildProjectCsv,
   calculateProjectSummary,
@@ -21,14 +28,58 @@ import {
   getKnownWorkerNames,
 } from './utils/calculations';
 import { createDemoData, createId, loadState, saveState } from './utils/storage';
+import {
+  cloudDeleteProject,
+  cloudDeleteTransaction,
+  cloudUpsertProject,
+  cloudUpsertTransaction,
+  getEnvFirebaseConfig,
+  normalizeTeamCode,
+  pushLocalDataToCloud,
+  subscribeToWorkspace,
+} from './utils/firebaseSync';
 import { TransactionModal } from './components/TransactionModal';
 import { ProjectModal } from './components/ProjectModal';
 import { SettingsModal } from './components/SettingsModal';
 
 type Tab = 'overview' | 'ledger' | 'workers' | 'projects';
 
+function readInviteFromUrl(): { teamCode?: string; firebaseConfig?: FirebaseConfig } {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const rawTeam = params.get('team');
+    const rawFb = params.get('fb');
+    const teamCode = rawTeam ? normalizeTeamCode(rawTeam) : undefined;
+    let firebaseConfig: FirebaseConfig | undefined;
+    if (rawFb) {
+      const parsed = JSON.parse(atob(rawFb)) as FirebaseConfig;
+      if (parsed.apiKey && parsed.projectId && parsed.appId) {
+        firebaseConfig = parsed;
+      }
+    }
+    return { teamCode: teamCode || undefined, firebaseConfig };
+  } catch {
+    return {};
+  }
+}
+
 export const App: React.FC = () => {
-  const [state, setState] = useState<AppState>(() => loadState());
+  const [state, setState] = useState<AppState>(() => {
+    const base = loadState();
+    const invite = readInviteFromUrl();
+    if (invite.teamCode) {
+      return {
+        ...base,
+        settings: {
+          ...base.settings,
+          teamCode: invite.teamCode,
+          firebaseConfig: invite.firebaseConfig ?? base.settings.firebaseConfig,
+        },
+      };
+    }
+    return base;
+  });
+
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const [ledgerFilter, setLedgerFilter] = useState<'all' | TransactionType>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -42,9 +93,61 @@ export const App: React.FC = () => {
 
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  const [syncStatus, setSyncStatus] = useState<
+    'offline' | 'connecting' | 'synced' | 'error'
+  >('offline');
+  const [syncError, setSyncError] = useState<string | undefined>(undefined);
+
+  const activeFirebaseConfig =
+    state.settings.firebaseConfig ?? getEnvFirebaseConfig();
+  const activeTeamCode = state.settings.teamCode;
+
   useEffect(() => {
     saveState(state);
   }, [state]);
+
+  useEffect(() => {
+    if (!activeTeamCode || !activeFirebaseConfig) {
+      setSyncStatus('offline');
+      setSyncError(undefined);
+      return;
+    }
+
+    setSyncStatus('connecting');
+    setSyncError(undefined);
+
+    const unsubscribe = subscribeToWorkspace(
+      activeFirebaseConfig,
+      activeTeamCode,
+      (cloudProjects) => {
+        setSyncStatus('synced');
+        setSyncError(undefined);
+        if (cloudProjects.length > 0) {
+          setState((prev) => ({
+            ...prev,
+            projects: cloudProjects,
+            activeProjectId: cloudProjects.some((p) => p.id === prev.activeProjectId)
+              ? prev.activeProjectId
+              : cloudProjects[0].id,
+          }));
+        }
+      },
+      (cloudTransactions) => {
+        setSyncStatus('synced');
+        setSyncError(undefined);
+        setState((prev) => ({
+          ...prev,
+          transactions: cloudTransactions,
+        }));
+      },
+      (errMsg) => {
+        setSyncStatus('error');
+        setSyncError(errMsg);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [activeTeamCode, activeFirebaseConfig]);
 
   const activeProject = useMemo(
     () =>
@@ -56,7 +159,10 @@ export const App: React.FC = () => {
     () =>
       state.transactions
         .filter((t) => t.projectId === activeProject.id)
-        .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+        .sort(
+          (a, b) =>
+            b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)
+        ),
     [state.transactions, activeProject.id]
   );
 
@@ -100,26 +206,31 @@ export const App: React.FC = () => {
     data: Omit<Transaction, 'id' | 'projectId' | 'createdAt'>,
     existingId?: string
   ) => {
-    setState((prev) => {
-      if (existingId) {
-        return {
-          ...prev,
-          transactions: prev.transactions.map((t) =>
-            t.id === existingId ? { ...t, ...data } : t
-          ),
+    const targetTx: Transaction = existingId
+      ? {
+          ...(state.transactions.find((t) => t.id === existingId) as Transaction),
+          ...data,
+        }
+      : {
+          ...data,
+          id: createId('tx'),
+          projectId: activeProject.id,
+          createdAt: new Date().toISOString(),
         };
-      }
-      const newTx: Transaction = {
-        ...data,
-        id: createId('tx'),
-        projectId: activeProject.id,
-        createdAt: new Date().toISOString(),
-      };
-      return {
-        ...prev,
-        transactions: [newTx, ...prev.transactions],
-      };
-    });
+
+    setState((prev) => ({
+      ...prev,
+      transactions: existingId
+        ? prev.transactions.map((t) => (t.id === existingId ? targetTx : t))
+        : [targetTx, ...prev.transactions],
+    }));
+
+    if (activeTeamCode && activeFirebaseConfig) {
+      cloudUpsertTransaction(activeFirebaseConfig, activeTeamCode, targetTx).catch(
+        (err) => setSyncError(String(err))
+      );
+    }
+
     setTxModalOpen(false);
     setEditingTx(null);
   };
@@ -129,6 +240,13 @@ export const App: React.FC = () => {
       ...prev,
       transactions: prev.transactions.filter((t) => t.id !== id),
     }));
+
+    if (activeTeamCode && activeFirebaseConfig) {
+      cloudDeleteTransaction(activeFirebaseConfig, activeTeamCode, id).catch((err) =>
+        setSyncError(String(err))
+      );
+    }
+
     setTxModalOpen(false);
     setEditingTx(null);
   };
@@ -137,31 +255,40 @@ export const App: React.FC = () => {
     data: { name: string; contractorName: string; status: 'active' | 'completed' },
     existingId?: string
   ) => {
-    setState((prev) => {
-      if (existingId) {
-        return {
-          ...prev,
-          projects: prev.projects.map((p) =>
-            p.id === existingId ? { ...p, ...data } : p
-          ),
+    const targetProj: Project = existingId
+      ? {
+          ...(state.projects.find((p) => p.id === existingId) as Project),
+          ...data,
+        }
+      : {
+          id: createId('proj'),
+          ...data,
+          createdAt: new Date().toISOString(),
         };
-      }
-      const newProj: Project = {
-        id: createId('proj'),
-        ...data,
-        createdAt: new Date().toISOString(),
-      };
-      return {
-        ...prev,
-        projects: [newProj, ...prev.projects],
-        activeProjectId: newProj.id,
-      };
-    });
+
+    setState((prev) => ({
+      ...prev,
+      projects: existingId
+        ? prev.projects.map((p) => (p.id === existingId ? targetProj : p))
+        : [targetProj, ...prev.projects],
+      activeProjectId: existingId ? prev.activeProjectId : targetProj.id,
+    }));
+
+    if (activeTeamCode && activeFirebaseConfig) {
+      cloudUpsertProject(activeFirebaseConfig, activeTeamCode, targetProj).catch(
+        (err) => setSyncError(String(err))
+      );
+    }
+
     setProjectModalOpen(false);
     setEditingProject(null);
   };
 
   const handleDeleteProject = (id: string) => {
+    const txIds = state.transactions
+      .filter((t) => t.projectId === id)
+      .map((t) => t.id);
+
     setState((prev) => {
       const remaining = prev.projects.filter((p) => p.id !== id);
       if (remaining.length === 0) return prev;
@@ -173,8 +300,49 @@ export const App: React.FC = () => {
           prev.activeProjectId === id ? remaining[0].id : prev.activeProjectId,
       };
     });
+
+    if (activeTeamCode && activeFirebaseConfig) {
+      cloudDeleteProject(activeFirebaseConfig, activeTeamCode, id, txIds).catch(
+        (err) => setSyncError(String(err))
+      );
+    }
+
     setProjectModalOpen(false);
     setEditingProject(null);
+  };
+
+  const handleConnectCloud = async (teamCode: string, config: FirebaseConfig) => {
+    setState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        teamCode,
+        firebaseConfig: config,
+      },
+    }));
+    try {
+      await pushLocalDataToCloud(
+        config,
+        teamCode,
+        state.projects,
+        state.transactions
+      );
+    } catch (err) {
+      setSyncStatus('error');
+      setSyncError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDisconnectCloud = () => {
+    setState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        teamCode: undefined,
+      },
+    }));
+    setSyncStatus('offline');
+    setSyncError(undefined);
   };
 
   const downloadFile = (content: string, filename: string, mime: string) => {
@@ -206,6 +374,14 @@ export const App: React.FC = () => {
       const parsed = JSON.parse(raw) as AppState;
       if (Array.isArray(parsed.projects) && parsed.projects.length > 0) {
         setState(parsed);
+        if (activeTeamCode && activeFirebaseConfig) {
+          pushLocalDataToCloud(
+            activeFirebaseConfig,
+            activeTeamCode,
+            parsed.projects,
+            parsed.transactions ?? []
+          ).catch((err) => setSyncError(String(err)));
+        }
         setSettingsOpen(false);
       }
     } catch {
@@ -260,13 +436,35 @@ export const App: React.FC = () => {
           <div style={{ minWidth: 0, flex: 1 }}>
             <div className="project-selector-title">{activeProject.name}</div>
             <div className="project-selector-sub">
-              {activeProject.contractorName
-                ? `Contractor: ${activeProject.contractorName}`
-                : 'Tap to switch or add project'}
+              {syncStatus === 'synced'
+                ? `Live Team: ${activeTeamCode}`
+                : activeProject.contractorName
+                  ? `Contractor: ${activeProject.contractorName}`
+                  : 'Tap to switch or add project'}
             </div>
           </div>
           <ChevronDown size={18} />
         </button>
+
+        {syncStatus === 'synced' && (
+          <div
+            title={`Synced to ${activeTeamCode}`}
+            style={{
+              background: 'rgba(16, 185, 129, 0.2)',
+              color: '#34d399',
+              padding: '6px 8px',
+              borderRadius: 10,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              fontSize: 11,
+              fontWeight: 700,
+            }}
+          >
+            <Cloud size={14} />
+            Live
+          </div>
+        )}
 
         <button
           type="button"
@@ -692,14 +890,35 @@ export const App: React.FC = () => {
       {settingsOpen && (
         <SettingsModal
           currency={currency}
+          teamCode={activeTeamCode}
+          firebaseConfig={state.settings.firebaseConfig}
+          syncStatus={syncStatus}
+          syncError={syncError}
           onChangeCurrency={(c) =>
-            setState((prev) => ({ ...prev, settings: { ...prev.settings, currency: c } }))
+            setState((prev) => ({
+              ...prev,
+              settings: { ...prev.settings, currency: c },
+            }))
           }
+          onConnectCloud={handleConnectCloud}
+          onDisconnectCloud={handleDisconnectCloud}
           onExportCsv={handleExportCsv}
           onExportJson={handleExportJson}
           onImportJson={handleImportJson}
           onLoadDemo={() => {
-            setState(createDemoData());
+            const demo = createDemoData();
+            setState((prev) => ({
+              ...demo,
+              settings: { ...prev.settings, currency: demo.settings.currency },
+            }));
+            if (activeTeamCode && activeFirebaseConfig) {
+              pushLocalDataToCloud(
+                activeFirebaseConfig,
+                activeTeamCode,
+                demo.projects,
+                demo.transactions
+              ).catch((err) => setSyncError(String(err)));
+            }
             setSettingsOpen(false);
           }}
           onClose={() => setSettingsOpen(false)}
@@ -710,4 +929,3 @@ export const App: React.FC = () => {
 };
 
 export default App;
-

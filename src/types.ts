@@ -42,8 +42,19 @@ export interface WorkerSummary {
   lastPaidDate: string;
 }
 
+export interface FirebaseConfig {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
+  appId: string;
+}
+
 export interface AppSettings {
   currency: string;
+  teamCode?: string;
+  firebaseConfig?: FirebaseConfig;
 }
 
 export interface AppState {
@@ -52,4 +63,3 @@ export interface AppState {
   activeProjectId: string;
   settings: AppSettings;
 }
-
